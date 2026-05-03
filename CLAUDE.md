@@ -144,6 +144,25 @@ Two layers, intentionally separated:
      -d '{"model":"gemma-4-E2B-it","messages":[{"role":"user","content":"Hello"}],"stream":true}'
    ```
 
+   For repeatable end-to-end checks, use the smoke scripts under
+   `scripts/`:
+
+   ```bash
+   # curl + jq, no Python deps. Covers /healthz, /v1/models, non-stream,
+   # stream (verifies SSE framing + [DONE]), empty-messages 400.
+   scripts/smoke.sh
+
+   # Real OpenAI Python SDK. Covers everything above plus system messages
+   # and sampler params, exercised through the same client real users
+   # would use.
+   pip install 'openai>=1.0'
+   scripts/smoke.py
+   ```
+
+   Both honor `BASE_URL` (default `http://localhost:8080` — assumes
+   `adb forward tcp:8080 tcp:8080`) and `MODEL` (default
+   `gemma-4-E2B-it`).
+
    If you can't run on-device, say so explicitly instead of claiming the
    change works.
 
