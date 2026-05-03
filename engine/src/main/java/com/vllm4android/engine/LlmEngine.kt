@@ -3,7 +3,6 @@ package com.vllm4android.engine
 import com.google.ai.edge.litertlm.Backend
 import com.google.ai.edge.litertlm.Engine
 import com.google.ai.edge.litertlm.EngineConfig
-import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
@@ -13,17 +12,17 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Thin wrapper around LiteRT-LM's [Engine].
+ * Production [LlmEngineApi] backed by LiteRT-LM.
  *
- * One [LlmEngine] holds a single loaded model and serializes generation requests
- * with a mutex — LiteRT-LM Conversations are not safe to interleave from
- * multiple coroutines, and a phone has nowhere near the resources for true
- * continuous batching anyway.
+ * One [LlmEngine] holds a single loaded model and serializes generation
+ * requests with a mutex — LiteRT-LM Conversations are not safe to interleave
+ * from multiple coroutines, and a phone has nowhere near the resources for
+ * true continuous batching anyway.
  */
 class LlmEngine(
     private val modelPath: String,
     private val backend: Backend = Backend.CPU(),
-) : AutoCloseable {
+) : LlmEngineApi, AutoCloseable {
 
     private var engine: Engine? = null
     private val generationLock = Mutex()
@@ -34,15 +33,15 @@ class LlmEngine(
         engine = Engine(config).also { it.initialize() }
     }
 
-    /**
-     * Streams tokens for [prompt] as a cold Flow. Emissions are partial text
-     * chunks (not full deltas — concatenating them yields the full response).
-     */
-    fun generateStream(
+    override fun generateStream(
         prompt: String,
-        sampler: SamplerConfig? = null,
+        params: GenerationParams,
     ): Flow<String> = flow {
         val e = requireNotNull(engine) { "Engine not initialized" }
+        // TODO(sampler): map [params] to LiteRT-LM SamplerConfig once the
+        // Conversation-level sampler override API is wired up. The values
+        // currently flow through the API surface but are not yet honored
+        // by the engine.
         generationLock.withLock {
             e.createConversation().use { conversation ->
                 conversation
@@ -51,15 +50,6 @@ class LlmEngine(
             }
         }
     }.flowOn(Dispatchers.IO)
-
-    suspend fun generate(prompt: String): String = withContext(Dispatchers.IO) {
-        val e = requireNotNull(engine) { "Engine not initialized" }
-        generationLock.withLock {
-            e.createConversation().use { conversation ->
-                conversation.sendMessage(prompt)
-            }
-        }
-    }
 
     override fun close() {
         engine?.close()

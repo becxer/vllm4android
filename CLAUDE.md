@@ -34,9 +34,12 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
 
 ### `engine/`
 
-- `LlmEngine.kt` — owns a single LiteRT-LM `Engine`, serializes generation
-  with a `Mutex` (one phone, one in-flight request), exposes a cold
-  `Flow<String>` of streamed chunks via `generateStream()`.
+- `LlmEngineApi.kt` — minimal interface (`generateStream(prompt, params)
+  : Flow<String>`) plus a LiteRT-free `GenerationParams` data class. The
+  server depends only on the interface; tests pass a `FakeEngine`.
+- `LlmEngine.kt` — production `LlmEngineApi` implementation. Owns a single
+  LiteRT-LM `Engine`, serializes generation with a `Mutex` (one phone, one
+  in-flight request).
 - `ChatTemplate.kt` — renders OpenAI-style `messages: [...]` into Gemma's
   `<start_of_turn>user … <end_of_turn>` format. System messages fold into
   the first user turn (Gemma has no dedicated system role).
@@ -47,7 +50,12 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
 ### `server/`
 
 - `dto/OpenAiDto.kt` — `@Serializable` request/response/chunk types.
-- `OpenAiServer.kt` — Ktor `embeddedServer(CIO, ...)` with:
+- `OpenAiServer.kt` — two pieces:
+  - `Application.openAiModule(engine, modelId)` extension installs all
+    routes/plugins on a Ktor application. **Tests call this directly** via
+    `testApplication { application { openAiModule(...) } }`.
+  - `OpenAiServer` class wraps `embeddedServer(CIO, ...)` for production.
+- Endpoints:
   - `GET /healthz`
   - `GET /v1/models`
   - `POST /v1/chat/completions` (non-stream → single `chat.completion`,
@@ -101,6 +109,47 @@ to change — don't drift.
    `ChatTemplate` and dispatch on `req.model` in the chat completions route.
 3. Update the `/v1/models` listing in `OpenAiServer.kt`.
 
+## Testing
+
+Two layers, intentionally separated:
+
+1. **JVM unit tests** — validate the OpenAI HTTP contract and the chat
+   template. No device, no model download.
+
+   ```bash
+   ./gradlew :server:test :engine:test
+   ```
+
+   Server tests use Ktor's `testApplication { application { openAiModule(
+   FakeEngine(), ...) } }` and assert: SSE framing (`data: ` prefix, blank-
+   line separator, `[DONE]` terminator), shared `id` across stream chunks,
+   `delta.role` first / `delta.content` middle / `finish_reason="stop"`
+   tail, OpenAI error envelope on `messages: []`, sampler params reach the
+   engine.
+
+   Engine tests cover `ChatTemplate.renderGemma` (system folding,
+   `assistant` → `model` rewrite, single application of system prefix).
+
+2. **On-device verification** — required for any change touching
+   `LlmEngine` or LiteRT-LM behavior. Type-checking and JVM tests are
+   *necessary but not sufficient* for declaring a server change done.
+
+   ```bash
+   ./gradlew :app:installDebug
+   adb logcat | grep -E 'litertlm|vllm4android'
+   adb forward tcp:8080 tcp:8080
+   curl http://localhost:8080/v1/models
+   curl http://localhost:8080/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"gemma-4-E2B-it","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+   ```
+
+   If you can't run on-device, say so explicitly instead of claiming the
+   change works.
+
+When adding a server route, prefer adding a JVM test using `FakeEngine`
+over only checking it manually with curl.
+
 ## Useful commands
 
 ```bash
@@ -110,15 +159,11 @@ to change — don't drift.
 # Install to a connected device
 ./gradlew :app:installDebug
 
+# Run JVM unit tests
+./gradlew :server:test :engine:test
+
 # Type-check / lint everything
 ./gradlew check
-
-# Once the server is running on the device, port-forward and hit it:
-adb forward tcp:8080 tcp:8080
-curl http://localhost:8080/v1/models
-curl http://localhost:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"gemma-4-E2B-it","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
 The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is **not yet** committed —
@@ -151,3 +196,7 @@ that has Gradle installed, then commit the result.
   a real client (`curl` is fine; the official `openai` Python SDK is
   better) before declaring done. If you can't test on-device, say so
   explicitly instead of claiming success.
+- **Use `FakeEngine` for protocol tests.** Tests live under
+  `server/src/test/`. New routes that have OpenAI-spec behavior (chunk
+  shape, error envelope, header) should get a JVM test before the manual
+  curl pass.
