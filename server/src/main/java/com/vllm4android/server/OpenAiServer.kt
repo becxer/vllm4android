@@ -34,6 +34,7 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.Writer
 import java.util.UUID
 
 private val defaultJson = Json {
@@ -75,9 +76,7 @@ fun Application.openAiModule(
         get("/v1/models") {
             call.respond(
                 ModelList(
-                    data = listOf(
-                        ModelEntry(id = modelId, created = System.currentTimeMillis() / 1000),
-                    ),
+                    data = listOf(ModelEntry(id = modelId, created = nowSeconds())),
                 ),
             )
         }
@@ -91,70 +90,19 @@ fun Application.openAiModule(
                 )
                 return@post
             }
-            val prompt = ChatTemplate.renderGemma(
-                req.messages.map { ChatTemplate.Message(it.role, it.content) },
-            )
-            val params = GenerationParams(
-                temperature = req.temperature,
-                topP = req.topP,
-                topK = req.topK,
-                maxTokens = req.maxTokens,
-            )
-            val id = "chatcmpl-" + UUID.randomUUID().toString().replace("-", "")
-            val created = System.currentTimeMillis() / 1000
+
+            val prompt = ChatTemplate.renderGemma(req.messages.toEngineMessages())
+            val params = req.toParams()
+            val id = newCompletionId()
+            val created = nowSeconds()
 
             if (req.stream) {
                 call.respondTextWriter(contentType = ContentType.parse("text/event-stream")) {
-                    writeSse(
-                        json.encodeToString(
-                            ChatCompletionChunk(
-                                id = id,
-                                created = created,
-                                model = modelId,
-                                choices = listOf(
-                                    ChatCompletionChunkChoice(
-                                        index = 0,
-                                        delta = ChatCompletionDelta(role = "assistant"),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    )
-                    engine.generateStream(prompt, params).collect { piece ->
-                        writeSse(
-                            json.encodeToString(
-                                ChatCompletionChunk(
-                                    id = id,
-                                    created = created,
-                                    model = modelId,
-                                    choices = listOf(
-                                        ChatCompletionChunkChoice(
-                                            index = 0,
-                                            delta = ChatCompletionDelta(content = piece),
-                                        ),
-                                    ),
-                                ),
-                            ),
-                        )
-                    }
-                    writeSse(
-                        json.encodeToString(
-                            ChatCompletionChunk(
-                                id = id,
-                                created = created,
-                                model = modelId,
-                                choices = listOf(
-                                    ChatCompletionChunkChoice(
-                                        index = 0,
-                                        delta = ChatCompletionDelta(),
-                                        finishReason = "stop",
-                                    ),
-                                ),
-                            ),
-                        ),
-                    )
-                    write("data: [DONE]\n\n")
-                    flush()
+                    val sse = SseChunkWriter(this, json, id, created, modelId)
+                    sse.role("assistant")
+                    engine.generateStream(prompt, params).collect { piece -> sse.content(piece) }
+                    sse.stop()
+                    sse.done()
                 }
             } else {
                 val text = buildString {
@@ -179,12 +127,59 @@ fun Application.openAiModule(
     }
 }
 
-private fun java.io.Writer.writeSse(payload: String) {
-    write("data: ")
-    write(payload)
-    write("\n\n")
-    flush()
+/**
+ * Writes OpenAI-style chat completion stream events onto an SSE [Writer].
+ *
+ * Each event is encoded as `data: {chunk}\n\n` and flushed immediately so
+ * tokens reach the client in real time. The `[DONE]` sentinel is written
+ * verbatim per the OpenAI streaming spec.
+ */
+private class SseChunkWriter(
+    private val writer: Writer,
+    private val json: Json,
+    private val id: String,
+    private val created: Long,
+    private val model: String,
+) {
+    fun role(role: String) = emit(ChatCompletionDelta(role = role), finishReason = null)
+    fun content(text: String) = emit(ChatCompletionDelta(content = text), finishReason = null)
+    fun stop() = emit(ChatCompletionDelta(), finishReason = "stop")
+
+    fun done() {
+        writer.write("data: [DONE]\n\n")
+        writer.flush()
+    }
+
+    private fun emit(delta: ChatCompletionDelta, finishReason: String?) {
+        val chunk = ChatCompletionChunk(
+            id = id,
+            created = created,
+            model = model,
+            choices = listOf(
+                ChatCompletionChunkChoice(index = 0, delta = delta, finishReason = finishReason),
+            ),
+        )
+        writer.write("data: ")
+        writer.write(json.encodeToString(chunk))
+        writer.write("\n\n")
+        writer.flush()
+    }
 }
+
+private fun newCompletionId(): String =
+    "chatcmpl-" + UUID.randomUUID().toString().replace("-", "")
+
+private fun nowSeconds(): Long = System.currentTimeMillis() / 1000
+
+private fun ChatCompletionRequest.toParams() = GenerationParams(
+    temperature = temperature,
+    topP = topP,
+    topK = topK,
+    maxTokens = maxTokens,
+)
+
+private fun List<ChatMessage>.toEngineMessages() =
+    map { ChatTemplate.Message(it.role, it.content) }
 
 /**
  * OpenAI-compatible HTTP server that owns a CIO [ApplicationEngine] and

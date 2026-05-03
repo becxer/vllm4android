@@ -23,8 +23,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Foreground service that owns the model download → engine load → HTTP server
- * pipeline. State is exposed via [State] so the UI can observe progress.
+ * Foreground service that owns the model download → engine load → HTTP
+ * server pipeline. The pipeline kicks off automatically on
+ * [onStartCommand], so the UI only has to start/stop the service — there
+ * is no separate "begin work" RPC and therefore no race between binding
+ * and starting.
+ *
+ * State is exposed via [State] through a local [Binder] so the UI can
+ * observe progress.
  */
 class LlmServerService : Service() {
 
@@ -39,14 +45,13 @@ class LlmServerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var engine: LlmEngine? = null
     private var server: OpenAiServer? = null
-    private var startJob: Job? = null
+    private var pipelineJob: Job? = null
 
     private val _state = MutableStateFlow<State>(State.Idle)
 
     private val binder = LocalBinder()
     inner class LocalBinder : android.os.Binder() {
         val state: StateFlow<State> get() = _state.asStateFlow()
-        fun start() = this@LlmServerService.startPipeline()
         fun stop() = this@LlmServerService.stopPipeline()
     }
 
@@ -54,41 +59,16 @@ class LlmServerService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification("Starting…"))
+        startPipeline()
         return START_STICKY
     }
 
     private fun startPipeline() {
-        if (startJob?.isActive == true) return
-        startJob = scope.launch {
+        if (pipelineJob?.isActive == true) return
+        pipelineJob = scope.launch {
             try {
-                val downloader = ModelDownloader(cacheDir = filesDir)
-                val spec = ModelDownloader.GEMMA_4_E2B_IT
-                downloader.download(spec).collect { p ->
-                    when (p) {
-                        is ModelDownloader.Progress.Downloading -> {
-                            _state.value = State.Downloading(p.bytesRead, p.totalBytes)
-                            updateNotification("Downloading model… ${humanBytes(p.bytesRead)} / ${humanBytes(p.totalBytes)}")
-                        }
-                        is ModelDownloader.Progress.Done -> Unit
-                    }
-                }
-
-                _state.value = State.Loading
-                updateNotification("Loading model into memory…")
-
-                val modelFile = downloader.localFile(spec)
-                val newEngine = LlmEngine(modelPath = modelFile.absolutePath).also { it.initialize() }
-                engine = newEngine
-
-                val newServer = OpenAiServer(
-                    engine = newEngine,
-                    modelId = MODEL_ID,
-                    port = SERVER_PORT,
-                ).also { it.start() }
-                server = newServer
-
-                _state.value = State.Running(SERVER_PORT)
-                updateNotification("Serving on port $SERVER_PORT")
+                val modelFile = downloadModel()
+                loadEngineAndServe(modelFile.absolutePath)
             } catch (t: Throwable) {
                 _state.value = State.Error(t.message ?: t.toString())
                 updateNotification("Error: ${t.message}")
@@ -96,8 +76,44 @@ class LlmServerService : Service() {
         }
     }
 
+    private suspend fun downloadModel(): java.io.File {
+        val downloader = ModelDownloader(cacheDir = filesDir)
+        val spec = ModelDownloader.GEMMA_4_E2B_IT
+        downloader.download(spec).collect { p ->
+            when (p) {
+                is ModelDownloader.Progress.Downloading -> {
+                    _state.value = State.Downloading(p.bytesRead, p.totalBytes)
+                    updateNotification(
+                        "Downloading model… ${humanBytes(p.bytesRead)} / ${humanBytes(p.totalBytes)}",
+                    )
+                }
+                is ModelDownloader.Progress.Done -> Unit
+            }
+        }
+        return downloader.localFile(spec)
+    }
+
+    private suspend fun loadEngineAndServe(modelPath: String) {
+        _state.value = State.Loading
+        updateNotification("Loading model into memory…")
+
+        val newEngine = LlmEngine(modelPath = modelPath).also { it.initialize() }
+        engine = newEngine
+
+        val newServer = OpenAiServer(
+            engine = newEngine,
+            modelId = MODEL_ID,
+            port = SERVER_PORT,
+        ).also { it.start() }
+        server = newServer
+
+        _state.value = State.Running(SERVER_PORT)
+        updateNotification("Serving on port $SERVER_PORT")
+    }
+
     private fun stopPipeline() {
         scope.launch {
+            pipelineJob?.cancel()
             server?.stop()
             engine?.close()
             server = null
@@ -109,7 +125,7 @@ class LlmServerService : Service() {
     }
 
     override fun onDestroy() {
-        startJob?.cancel()
+        pipelineJob?.cancel()
         server?.stop()
         engine?.close()
         scope.cancel()

@@ -2,7 +2,6 @@ package com.vllm4android.server.dto
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.JsonElement
 
 @Serializable
 data class ChatMessage(
@@ -89,5 +88,5 @@ data class ApiError(val error: ApiErrorBody)
 data class ApiErrorBody(
     val message: String,
     val type: String = "invalid_request_error",
-    val code: JsonElement? = null,
+    val code: String? = null,
 )

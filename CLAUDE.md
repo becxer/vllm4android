@@ -63,10 +63,16 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
 
 ### `app/`
 
-- `MainActivity.kt` — Compose UI (start/stop, progress, sample curl).
+- `MainActivity.kt` — wires the activity to the foreground service via
+  `bindService` and a `StateFlow<LocalBinder?>`. Owns no UI logic of its
+  own — it just hands service state to `ServerScreen`.
+- `ui/ServerScreen.kt` — Compose UI (start/stop buttons, progress, sample
+  curl). Pure stateless composable that takes `(state, onStart, onStop)`.
 - `service/LlmServerService.kt` — `Service` (foreground, `dataSync` type)
   that runs the download → load → serve pipeline and exposes a `StateFlow`
-  to the activity via a local binder.
+  to the activity via a local binder. The pipeline auto-starts in
+  `onStartCommand`, so the UI never has to call a "start work" RPC across
+  the bind boundary (which would race with `onServiceConnected`).
 
 ## Conventions / decisions
 
@@ -144,19 +150,19 @@ Two layers, intentionally separated:
      -d '{"model":"gemma-4-E2B-it","messages":[{"role":"user","content":"Hello"}],"stream":true}'
    ```
 
-   For repeatable end-to-end checks, use the smoke scripts under
+   For repeatable end-to-end checks, use the test scripts under
    `scripts/`:
 
    ```bash
    # curl + jq, no Python deps. Covers /healthz, /v1/models, non-stream,
    # stream (verifies SSE framing + [DONE]), empty-messages 400.
-   scripts/smoke.sh
+   scripts/test.sh
 
    # Real OpenAI Python SDK. Covers everything above plus system messages
    # and sampler params, exercised through the same client real users
    # would use.
    pip install 'openai>=1.0'
-   scripts/smoke.py
+   scripts/test.py
    ```
 
    Both honor `BASE_URL` (default `http://localhost:8080` — assumes
