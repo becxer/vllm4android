@@ -17,10 +17,14 @@ data class GenerationParams(
 /**
  * Minimal surface the server module needs from a language model engine.
  * The production implementation is [LlmEngine]; tests use a fake.
+ *
+ * The engine receives full conversational context as [ChatTurn]s — turns
+ * may contain text only or mix text and image parts (multimodal). The
+ * implementation chooses the right LiteRT-LM call based on the contents.
  */
 interface LlmEngineApi {
     fun generateStream(
-        prompt: String,
+        turns: List<ChatTurn>,
         params: GenerationParams = GenerationParams(),
     ): Flow<String>
 }

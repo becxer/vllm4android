@@ -34,15 +34,25 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
 
 ### `engine/`
 
-- `LlmEngineApi.kt` — minimal interface (`generateStream(prompt, params)
-  : Flow<String>`) plus a LiteRT-free `GenerationParams` data class. The
-  server depends only on the interface; tests pass a `FakeEngine`.
-- `LlmEngine.kt` — production `LlmEngineApi` implementation. Owns a single
-  LiteRT-LM `Engine`, serializes generation with a `Mutex` (one phone, one
-  in-flight request).
-- `ChatTemplate.kt` — renders OpenAI-style `messages: [...]` into Gemma's
-  `<start_of_turn>user … <end_of_turn>` format. System messages fold into
-  the first user turn (Gemma has no dedicated system role).
+- `LlmEngineApi.kt` — minimal interface
+  (`generateStream(turns: List<ChatTurn>, params): Flow<String>`) plus a
+  LiteRT-free `GenerationParams`. The server depends only on the
+  interface; tests pass a `FakeEngine`.
+- `ContentPart.kt` — `ContentPart.{Text, Image}` sealed type plus
+  `ChatTurn(role, parts)`. The unit of conversation passed across the
+  engine boundary; same shape for text-only and multimodal requests.
+- `LlmEngine.kt` — production `LlmEngineApi` impl. Owns a single
+  LiteRT-LM `Engine`, serializes generation with a `Mutex`. Routes
+  internally:
+  - **text-only turns** → render Gemma string template →
+    `Conversation.sendMessageAsync(prompt: String)`
+  - **multimodal turns** (any `ContentPart.Image` present) → build
+    `Contents.of(Content.Text(...), Content.ImageBytes(...))` →
+    `Conversation.sendMessageAsync(contents: Contents)`
+- `ChatTemplate.kt` — text-only Gemma template renderer
+  (`<start_of_turn>user … <end_of_turn>`). System messages fold into the
+  first user turn. **Multimodal path bypasses this** — LiteRT-LM handles
+  templating internally for `Contents`.
 - `ModelDownloader.kt` — first-launch download from Hugging Face
   (`https://huggingface.co/{repo}/resolve/{rev}/{file}`), atomic rename via
   `.part`, cached under `filesDir`.
@@ -50,6 +60,14 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
 ### `server/`
 
 - `dto/OpenAiDto.kt` — `@Serializable` request/response/chunk types.
+  `ChatMessage.content` is intentionally `JsonElement` (string OR array of
+  parts) to match OpenAI's polymorphic shape.
+- `ContentDecoder.kt` — converts an OpenAI `ChatMessage` into the engine's
+  `ChatTurn` representation. Handles legacy string content, `text` parts,
+  and `image_url` parts with `data:image/...;base64,...` URIs. Throws
+  `InvalidContentException` (StatusPages → 400) for malformed payloads.
+  HTTP image URLs are rejected — the server does not fetch external
+  resources.
 - `OpenAiServer.kt` — two pieces:
   - `Application.openAiModule(engine, modelId)` extension installs all
     routes/plugins on a Ktor application. **Tests call this directly** via
@@ -60,6 +78,9 @@ that links to `com.google.ai.edge.litertlm:litertlm-android`.
   - `GET /v1/models`
   - `POST /v1/chat/completions` (non-stream → single `chat.completion`,
     stream → SSE `data: {...chunk...}\n\n` ending in `data: [DONE]`).
+    Accepts both text-only (`content: "hi"`) and multimodal
+    (`content: [{type:"text",...},{type:"image_url",...}]`) message
+    bodies — see "Multimodal" below for the v1 limitations.
 
 ### `app/`
 
@@ -100,6 +121,38 @@ to change — don't drift.
 - **Chat template:** Gemma format. If we add non-Gemma models later, route
   on `req.model` rather than branching inside `ChatTemplate.renderGemma`.
 
+## Multimodal
+
+Gemma 4 IT is multimodal (text + image). The server accepts OpenAI-style
+multimodal content arrays and forwards image bytes to LiteRT-LM as
+`Content.ImageBytes`. Current limits:
+
+- **Image URLs must be `data:` URIs** (base64-encoded). HTTP fetches are
+  not done server-side.
+- **v1 supports a single user turn** with images (plus optional system
+  messages). Multi-turn vision (history that includes earlier image
+  responses) requires LiteRT-LM `Conversation` history replay and is
+  rejected with 400 — TODO.
+- The **Gemma chat template is bypassed** for multimodal calls;
+  LiteRT-LM's `Conversation.sendMessage(Contents.of(...))` handles
+  templating itself.
+
+Sample request shape:
+
+```json
+{
+  "model": "gemma-4-E2B-it",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What's in this image?"},
+      {"type": "image_url",
+       "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ..."}}
+    ]
+  }]
+}
+```
+
 ## Adding a new endpoint
 
 1. Add the request/response types to `server/dto/OpenAiDto.kt` with
@@ -131,7 +184,9 @@ Two layers, intentionally separated:
    line separator, `[DONE]` terminator), shared `id` across stream chunks,
    `delta.role` first / `delta.content` middle / `finish_reason="stop"`
    tail, OpenAI error envelope on `messages: []`, sampler params reach the
-   engine.
+   engine, **multimodal** (`image_url` data URI decodes to
+   `ContentPart.Image` bytes round-tripped exactly; HTTP URLs and unknown
+   part types → 400).
 
    Engine tests cover `ChatTemplate.renderGemma` (system folding,
    `assistant` → `model` rewrite, single application of system prefix).
@@ -158,14 +213,17 @@ Two layers, intentionally separated:
    # stream (verifies SSE framing + [DONE]), empty-messages 400.
    scripts/test.sh
 
-   # Real OpenAI Python SDK. Covers everything above plus system messages
-   # and sampler params, exercised through the same client real users
-   # would use.
+   # Real OpenAI Python SDK. Covers everything above plus system messages,
+   # sampler params, and an image-description multimodal call — exercised
+   # through the same client real users would use.
    pip install 'openai>=1.0'
    scripts/test.py
+
+   # Multimodal: substitute your own picture for a meaningful description.
+   IMAGE_PATH=path/to/cat.jpg scripts/test.py
    ```
 
-   Both honor `BASE_URL` (default `http://localhost:8080` — assumes
+   All scripts honor `BASE_URL` (default `http://localhost:8080` — assumes
    `adb forward tcp:8080 tcp:8080`) and `MODEL` (default
    `gemma-4-E2B-it`).
 

@@ -12,13 +12,17 @@ Prereqs:
     - pip install 'openai>=1.0'
 
 Usage:
-    scripts/smoke.py
-    BASE_URL=http://192.168.1.10:8080 scripts/smoke.py
-    MODEL=gemma-4-E4B-it scripts/smoke.py
+    scripts/test.py
+    BASE_URL=http://192.168.1.10:8080 scripts/test.py
+    MODEL=gemma-4-E4B-it scripts/test.py
+    IMAGE_PATH=path/to/cat.jpg scripts/test.py   # use a real picture for vision
 """
 from __future__ import annotations
 
+import base64
+import mimetypes
 import os
+import pathlib
 import sys
 
 try:
@@ -29,6 +33,16 @@ except ImportError:
 BASE_URL = os.environ.get("BASE_URL", "http://localhost:8080")
 MODEL = os.environ.get("MODEL", "gemma-4-E2B-it")
 TIMEOUT = float(os.environ.get("TIMEOUT", "180"))
+IMAGE_PATH = os.environ.get("IMAGE_PATH")  # optional override; uses a 1x1 PNG otherwise
+
+# A 1x1 transparent PNG. Tiny but valid — enough to exercise the multimodal
+# pipeline end-to-end (data URI → base64 decode → ContentPart.Image →
+# Content.ImageBytes → LiteRT-LM). Set IMAGE_PATH to substitute your own
+# picture for a more interesting description.
+PIXEL_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 GREEN = "\033[32m"
 RED = "\033[31m"
@@ -171,6 +185,44 @@ def test_sampler_params() -> None:
     passed("sampler params accepted (temperature, top_p, max_tokens)")
 
 
+def _load_image_data_uri() -> str:
+    """Return a `data:` URI for either the user-supplied IMAGE_PATH or
+    the bundled 1×1 PNG fallback."""
+    if not IMAGE_PATH:
+        return f"data:image/png;base64,{PIXEL_PNG_B64}"
+    path = pathlib.Path(IMAGE_PATH)
+    if not path.is_file():
+        failed("image", f"IMAGE_PATH not found: {path}")
+    mime = mimetypes.guess_type(path.name)[0] or "image/jpeg"
+    b64 = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def test_image_description() -> None:
+    """Multimodal: send an image + text prompt and expect a non-empty
+    description back. Gemma 4 IT is multimodal so this exercises the full
+    pipeline (Python SDK → JSON → ContentDecoder → ChatTurn → LlmEngine →
+    LiteRT-LM Content.ImageBytes → model). We don't assert on the *content*
+    of the description (non-deterministic), just that the call succeeds
+    and returns text."""
+    data_uri = _load_image_data_uri()
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Briefly describe this image in one sentence."},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }],
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    if not content:
+        failed("image description", "empty content")
+    src = IMAGE_PATH or "1x1 PNG"
+    passed(f"image description ({src}) → {content!r}")
+
+
 def main() -> None:
     print(f"Smoke test → {BASE_URL}  model={MODEL}\n")
     test_models()
@@ -179,6 +231,7 @@ def main() -> None:
     test_stream()
     test_system_message()
     test_sampler_params()
+    test_image_description()
     print(f"\n{GREEN}All smoke tests passed.{RESET}")
 
 

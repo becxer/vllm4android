@@ -1,6 +1,5 @@
 package com.vllm4android.server
 
-import com.vllm4android.engine.ChatTemplate
 import com.vllm4android.engine.GenerationParams
 import com.vllm4android.engine.LlmEngineApi
 import com.vllm4android.server.dto.ApiError
@@ -34,6 +33,7 @@ import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
 import java.io.Writer
 import java.util.UUID
 
@@ -63,6 +63,12 @@ fun Application.openAiModule(
         allowMethod(HttpMethod.Options)
     }
     install(StatusPages) {
+        exception<InvalidContentException> { call, cause ->
+            call.respond(
+                HttpStatusCode.BadRequest,
+                ApiError(ApiErrorBody(message = cause.message ?: "invalid content")),
+            )
+        }
         exception<Throwable> { call, cause ->
             call.respond(
                 HttpStatusCode.InternalServerError,
@@ -91,7 +97,9 @@ fun Application.openAiModule(
                 return@post
             }
 
-            val prompt = ChatTemplate.renderGemma(req.messages.toEngineMessages())
+            // toChatTurn() throws InvalidContentException for malformed
+            // multimodal payloads; StatusPages turns those into 400s.
+            val turns = req.messages.map { it.toChatTurn() }
             val params = req.toParams()
             val id = newCompletionId()
             val created = nowSeconds()
@@ -100,13 +108,13 @@ fun Application.openAiModule(
                 call.respondTextWriter(contentType = ContentType.parse("text/event-stream")) {
                     val sse = SseChunkWriter(this, json, id, created, modelId)
                     sse.role("assistant")
-                    engine.generateStream(prompt, params).collect { piece -> sse.content(piece) }
+                    engine.generateStream(turns, params).collect { piece -> sse.content(piece) }
                     sse.stop()
                     sse.done()
                 }
             } else {
                 val text = buildString {
-                    engine.generateStream(prompt, params).collect { append(it) }
+                    engine.generateStream(turns, params).collect { append(it) }
                 }
                 call.respond(
                     ChatCompletionResponse(
@@ -116,7 +124,7 @@ fun Application.openAiModule(
                         choices = listOf(
                             ChatCompletionChoice(
                                 index = 0,
-                                message = ChatMessage(role = "assistant", content = text),
+                                message = ChatMessage(role = "assistant", content = JsonPrimitive(text)),
                                 finishReason = "stop",
                             ),
                         ),
@@ -177,9 +185,6 @@ private fun ChatCompletionRequest.toParams() = GenerationParams(
     topK = topK,
     maxTokens = maxTokens,
 )
-
-private fun List<ChatMessage>.toEngineMessages() =
-    map { ChatTemplate.Message(it.role, it.content) }
 
 /**
  * OpenAI-compatible HTTP server that owns a CIO [ApplicationEngine] and

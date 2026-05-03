@@ -2,11 +2,22 @@ package com.vllm4android.server.dto
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 
+/**
+ * OpenAI chat message. [content] is intentionally a [JsonElement] because
+ * the OpenAI spec allows two shapes:
+ *   - String:  `"content": "Hello"`
+ *   - Array of parts: `"content": [{"type":"text",...},{"type":"image_url",...}]`
+ *
+ * Decoding into typed parts is the route handler's job (see
+ * `chatMessageToChatTurn`). Responses always emit the string form by
+ * wrapping with `JsonPrimitive`.
+ */
 @Serializable
 data class ChatMessage(
     val role: String,
-    val content: String,
+    val content: JsonElement,
 )
 
 @Serializable
