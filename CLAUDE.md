@@ -2,109 +2,284 @@
 
 Guidance for AI assistants (e.g. Claude Code) working in this repository.
 
-## Repository status
+## Project goal
 
-This repository is in a pre-implementation state. As of the latest commit it
-contains only a `.gitkeep` placeholder and a single `Initialize repository`
-commit. No source code, build configuration, tests, or tooling exist yet.
+vLLM-style on-device LLM server for Android. Loads **Gemma 4 E2B IT**
+(`litert-community/gemma-4-E2B-it-litert-lm`) via [LiteRT-LM][litertlm] and
+exposes an **OpenAI Chat Completions–compatible** HTTP API
+(`POST /v1/chat/completions`, SSE streaming when `stream=true`) on the
+device, so existing OpenAI SDK clients can target the phone as their backend.
 
-The repository name (`vllm4android`) suggests the goal is to bring
-[vLLM](https://github.com/vllm-project/vllm) — a high-throughput LLM inference
-and serving engine — to the Android platform. Treat this as the working
-hypothesis until a `README.md`, design doc, or initial scaffolding lands.
+We are *not* implementing PagedAttention / continuous batching — those make
+no sense on a single-user mobile device. The "vLLM-like" parts we do keep:
+the OpenAI REST surface, streaming via SSE, model warm-loading at startup.
 
-When code is added, **update this file in the same change** so it reflects
-reality rather than this placeholder description.
+[litertlm]: https://github.com/google-ai-edge/LiteRT-LM
 
-## Repository layout
+## Module layout
 
 ```
 .
-├── .gitkeep        # placeholder, remove once real files exist
-└── CLAUDE.md       # this file
+├── app/        # Android app: Compose UI, foreground service, lifecycle glue
+├── engine/     # LiteRT-LM wrapper: model download, Engine/Conversation, chat template
+├── server/     # Ktor (CIO) HTTP server: OpenAI-compatible routes + DTOs
+├── gradle/libs.versions.toml   # version catalog
+├── settings.gradle.kts
+├── build.gradle.kts
+└── gradle.properties
 ```
 
-## Development workflow
+Module dependencies: `app → server → engine`. `engine` is the only module
+that links to `com.google.ai.edge.litertlm:litertlm-android`.
 
-### Branching
+### `engine/`
 
-- `main` is the integration branch.
-- Feature work happens on prefixed branches. Claude-authored work uses
-  `claude/<short-description>-<suffix>` (e.g.
-  `claude/add-claude-documentation-6d9kS`).
-- Do **not** push directly to `main`. Always push to the assigned feature
-  branch and open a PR only when explicitly asked.
+- `LlmEngineApi.kt` — minimal interface
+  (`generateStream(turns: List<ChatTurn>, params): Flow<String>`) plus a
+  LiteRT-free `GenerationParams`. The server depends only on the
+  interface; tests pass a `FakeEngine`.
+- `ContentPart.kt` — `ContentPart.{Text, Image}` sealed type plus
+  `ChatTurn(role, parts)`. The unit of conversation passed across the
+  engine boundary; same shape for text-only and multimodal requests.
+- `LlmEngine.kt` — production `LlmEngineApi` impl. Owns a single
+  LiteRT-LM `Engine`, serializes generation with a `Mutex`. Routes
+  internally:
+  - **text-only turns** → render Gemma string template →
+    `Conversation.sendMessageAsync(prompt: String)`
+  - **multimodal turns** (any `ContentPart.Image` present) → build
+    `Contents.of(Content.Text(...), Content.ImageBytes(...))` →
+    `Conversation.sendMessageAsync(contents: Contents)`
+- `ChatTemplate.kt` — text-only Gemma template renderer
+  (`<start_of_turn>user … <end_of_turn>`). System messages fold into the
+  first user turn. **Multimodal path bypasses this** — LiteRT-LM handles
+  templating internally for `Contents`.
+- `ModelDownloader.kt` — first-launch download from Hugging Face
+  (`https://huggingface.co/{repo}/resolve/{rev}/{file}`), atomic rename via
+  `.part`, cached under `filesDir`.
 
-### Commits
+### `server/`
 
-- Write descriptive messages focused on the *why*.
-- Prefer small, logical commits over a single squashed change.
-- Never use `--no-verify` or skip hooks unless the user explicitly requests it.
-- Never amend a commit that has already been pushed.
+- `dto/OpenAiDto.kt` — `@Serializable` request/response/chunk types.
+  `ChatMessage.content` is intentionally `JsonElement` (string OR array of
+  parts) to match OpenAI's polymorphic shape.
+- `ContentDecoder.kt` — converts an OpenAI `ChatMessage` into the engine's
+  `ChatTurn` representation. Handles legacy string content, `text` parts,
+  and `image_url` parts with `data:image/...;base64,...` URIs. Throws
+  `InvalidContentException` (StatusPages → 400) for malformed payloads.
+  HTTP image URLs are rejected — the server does not fetch external
+  resources.
+- `OpenAiServer.kt` — two pieces:
+  - `Application.openAiModule(engine, modelId)` extension installs all
+    routes/plugins on a Ktor application. **Tests call this directly** via
+    `testApplication { application { openAiModule(...) } }`.
+  - `OpenAiServer` class wraps `embeddedServer(CIO, ...)` for production.
+- Endpoints:
+  - `GET /healthz`
+  - `GET /v1/models`
+  - `POST /v1/chat/completions` (non-stream → single `chat.completion`,
+    stream → SSE `data: {...chunk...}\n\n` ending in `data: [DONE]`).
+    Accepts both text-only (`content: "hi"`) and multimodal
+    (`content: [{type:"text",...},{type:"image_url",...}]`) message
+    bodies — see "Multimodal" below for the v1 limitations.
 
-### Pushing
+### `app/`
 
-- Use `git push -u origin <branch-name>`.
-- On transient network failures, retry up to 4 times with exponential backoff
-  (2s, 4s, 8s, 16s). Do not retry on non-network errors — diagnose instead.
+- `MainActivity.kt` — wires the activity to the foreground service via
+  `bindService` and a `StateFlow<LocalBinder?>`. Owns no UI logic of its
+  own — it just hands service state to `ServerScreen`.
+- `ui/ServerScreen.kt` — Compose UI (start/stop buttons, progress, sample
+  curl). Pure stateless composable that takes `(state, onStart, onStop)`.
+- `service/LlmServerService.kt` — `Service` (foreground, `dataSync` type)
+  that runs the download → load → serve pipeline and exposes a `StateFlow`
+  to the activity via a local binder. The pipeline auto-starts in
+  `onStartCommand`, so the UI never has to call a "start work" RPC across
+  the bind boundary (which would race with `onServiceConnected`).
 
-### Pull requests
+## Conventions / decisions
 
-- Do **not** open a PR unless the user asks for one.
-- This repo is restricted to the `becxer/vllm4android` remote. Do not interact
-  with other repositories via the GitHub MCP tools.
+These were chosen during initial scaffolding. Revisit explicitly if you want
+to change — don't drift.
 
-## Conventions to establish
+- **minSdk 31, targetSdk 34, JDK 17, Kotlin 2.1, AGP 8.7.**
+- **Kotlin DSL** for all Gradle files. Versions live in
+  `gradle/libs.versions.toml` (version catalog) — never hard-code a version
+  inside a `build.gradle.kts`.
+- **HTTP server: Ktor + CIO engine.** Picked over NanoHTTPD because Ktor
+  has first-class coroutines/Flow integration and we already stream tokens
+  as a Flow.
+- **Server lifecycle: foreground `Service`** with `foregroundServiceType="dataSync"`.
+  Required on Android 12+ for long-running networking. The service owns the
+  `LlmEngine` instance — there is exactly one per process.
+- **Concurrency model:** one `Engine`, one in-flight generation. We
+  serialize requests with a `Mutex` inside `LlmEngine` rather than queueing
+  at the HTTP layer.
+- **Model distribution:** download from HF on first run into `filesDir`.
+  Do **not** check `.litertlm` files into git (already in `.gitignore`).
+- **Backend:** `Backend.CPU()` (XNNPACK, 4 threads) by default. GPU/NPU
+  variants exist on the model repo — switching requires loading a different
+  `.litertlm` artifact, not just changing the `Backend` enum.
+- **Chat template:** Gemma format. If we add non-Gemma models later, route
+  on `req.model` rather than branching inside `ChatTemplate.renderGemma`.
 
-The following are not yet decided. When the first real change introduces a
-choice, record it here:
+## Multimodal
 
-- **Language / runtime** — likely a mix of Kotlin/Java (Android app layer),
-  C++ (inference kernels, NDK), and possibly Python (tooling, model
-  conversion). Confirm before assuming.
-- **Build system** — Gradle for the Android side; CMake/Ninja for native
-  components is conventional. Not yet present.
-- **Target Android API level / NDK version** — to be decided.
-- **Model format / runtime backend** — vLLM upstream targets CUDA; Android
-  deployment will need a different backend (e.g. GGUF + llama.cpp,
-  ONNX Runtime Mobile, MediaPipe LLM, MLC-LLM, or a custom NDK port).
-  Document the choice when made.
-- **Testing strategy** — unit tests, instrumented tests, on-device
-  benchmarks. None set up yet.
-- **Linting / formatting** — `ktlint`/`detekt`, `clang-format`, etc.
-  Not yet configured.
+Gemma 4 IT is multimodal (text + image). The server accepts OpenAI-style
+multimodal content arrays and forwards image bytes to LiteRT-LM as
+`Content.ImageBytes`. Current limits:
 
-## Guidance for AI assistants
+- **Image URLs must be `data:` URIs** (base64-encoded). HTTP fetches are
+  not done server-side.
+- **v1 supports a single user turn** with images (plus optional system
+  messages). Multi-turn vision (history that includes earlier image
+  responses) requires LiteRT-LM `Conversation` history replay and is
+  rejected with 400 — TODO.
+- The **Gemma chat template is bypassed** for multimodal calls;
+  LiteRT-LM's `Conversation.sendMessage(Contents.of(...))` handles
+  templating itself.
 
-- **Do not invent project structure.** With nothing to go on, ask the user
-  before scaffolding an Android project, picking a backend, or adding
-  dependencies. Those are architectural decisions, not implementation
-  details.
-- **Read before writing.** Once files exist, use `Read` / `Grep` to
-  understand current patterns before editing. Match the surrounding style.
-- **Prefer editing existing files** over creating new ones. Do not create
-  README.md, docs, or example files unless asked.
-- **No speculative abstractions.** Build only what the current task
-  requires.
-- **Keep this file current.** When you add the first build file, source
-  tree, or CI workflow, replace the corresponding section above with the
-  concrete details (commands, paths, conventions actually in use).
+Sample request shape:
+
+```json
+{
+  "model": "gemma-4-E2B-it",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What's in this image?"},
+      {"type": "image_url",
+       "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ..."}}
+    ]
+  }]
+}
+```
+
+## Adding a new endpoint
+
+1. Add the request/response types to `server/dto/OpenAiDto.kt` with
+   `@Serializable` and `@SerialName` for any snake_case fields.
+2. Add the route inside the `routing { }` block in `OpenAiServer.kt`.
+3. If it generates text, go through `LlmEngine.generateStream()` so the
+   mutex/serialization stays in one place.
+
+## Adding a new model
+
+1. Add a `ModelDownloader.Spec` constant alongside `GEMMA_4_E2B_IT`.
+2. If the prompt format differs from Gemma, add a renderer to
+   `ChatTemplate` and dispatch on `req.model` in the chat completions route.
+3. Update the `/v1/models` listing in `OpenAiServer.kt`.
+
+## Testing
+
+Two layers, intentionally separated:
+
+1. **JVM unit tests** — validate the OpenAI HTTP contract and the chat
+   template. No device, no model download.
+
+   ```bash
+   ./gradlew :server:test :engine:test
+   ```
+
+   Server tests use Ktor's `testApplication { application { openAiModule(
+   FakeEngine(), ...) } }` and assert: SSE framing (`data: ` prefix, blank-
+   line separator, `[DONE]` terminator), shared `id` across stream chunks,
+   `delta.role` first / `delta.content` middle / `finish_reason="stop"`
+   tail, OpenAI error envelope on `messages: []`, sampler params reach the
+   engine, **multimodal** (`image_url` data URI decodes to
+   `ContentPart.Image` bytes round-tripped exactly; HTTP URLs and unknown
+   part types → 400).
+
+   Engine tests cover `ChatTemplate.renderGemma` (system folding,
+   `assistant` → `model` rewrite, single application of system prefix).
+
+2. **On-device verification** — required for any change touching
+   `LlmEngine` or LiteRT-LM behavior. Type-checking and JVM tests are
+   *necessary but not sufficient* for declaring a server change done.
+
+   ```bash
+   ./gradlew :app:installDebug
+   adb logcat | grep -E 'litertlm|vllm4android'
+   adb forward tcp:8080 tcp:8080
+   curl http://localhost:8080/v1/models
+   curl http://localhost:8080/v1/chat/completions \
+     -H 'Content-Type: application/json' \
+     -d '{"model":"gemma-4-E2B-it","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+   ```
+
+   For repeatable end-to-end checks, use the test scripts under
+   `scripts/`:
+
+   ```bash
+   # curl + jq, no Python deps. Covers /healthz, /v1/models, non-stream,
+   # stream (verifies SSE framing + [DONE]), empty-messages 400.
+   scripts/test.sh
+
+   # Real OpenAI Python SDK. Covers everything above plus system messages,
+   # sampler params, and an image-description multimodal call — exercised
+   # through the same client real users would use.
+   pip install 'openai>=1.0'
+   scripts/test.py
+
+   # Multimodal: substitute your own picture for a meaningful description.
+   IMAGE_PATH=path/to/cat.jpg scripts/test.py
+   ```
+
+   All scripts honor `BASE_URL` (default `http://localhost:8080` — assumes
+   `adb forward tcp:8080 tcp:8080`) and `MODEL` (default
+   `gemma-4-E2B-it`).
+
+   If you can't run on-device, say so explicitly instead of claiming the
+   change works.
+
+When adding a server route, prefer adding a JVM test using `FakeEngine`
+over only checking it manually with curl.
 
 ## Useful commands
 
-None yet — there is nothing to build, run, or test. Populate this section
-as soon as a build system is in place. Expected entries (placeholder):
+```bash
+# Debug build
+./gradlew :app:assembleDebug
 
+# Install to a connected device
+./gradlew :app:installDebug
+
+# Run JVM unit tests
+./gradlew :server:test :engine:test
+
+# Type-check / lint everything
+./gradlew check
 ```
-# Build the Android app (once Gradle is set up)
-./gradlew assembleDebug
 
-# Run unit tests
-./gradlew test
+The Gradle wrapper (`gradlew`, `gradle/wrapper/`) is **not yet** committed —
+generate it once with `gradle wrapper --gradle-version 8.11.1` on a machine
+that has Gradle installed, then commit the result.
 
-# Run instrumented tests on a connected device
-./gradlew connectedAndroidTest
+## Workflow
 
-# Build native components (once CMake is wired in)
-cmake --build build
-```
+- Branch: `claude/add-claude-documentation-6d9kS` (current). Don't push to
+  `main`. PRs only when the user asks.
+- `git push -u origin <branch>`. Retry network failures up to 4× with
+  exponential backoff (2/4/8/16s). Don't retry non-network failures.
+- This repo is restricted to `becxer/vllm4android` for any GitHub MCP calls.
+
+## Guidance for AI assistants
+
+- **Read before writing.** Match existing module/package conventions
+  (`com.vllm4android.{app,engine,server}`).
+- **No premature abstractions.** A second model arriving is the time to
+  introduce a `ModelRegistry`, not before.
+- **No new docs unless asked.** Keep this file in sync; don't spawn
+  `README.md`, `ARCHITECTURE.md`, etc. on your own.
+- **Don't commit model files.** They're in `.gitignore` for a reason
+  (`.litertlm` is GiB-scale).
+- **Keep `LlmEngine` the single concurrency boundary.** Don't add
+  request-level locks in the server module — the engine already does it.
+- **Server changes need device verification.** Type-checking is not enough
+  for SSE / OpenAI-client compatibility. After changes to
+  `OpenAiServer.kt`, exercise both `stream=false` and `stream=true` against
+  a real client (`curl` is fine; the official `openai` Python SDK is
+  better) before declaring done. If you can't test on-device, say so
+  explicitly instead of claiming success.
+- **Use `FakeEngine` for protocol tests.** Tests live under
+  `server/src/test/`. New routes that have OpenAI-spec behavior (chunk
+  shape, error envelope, header) should get a JVM test before the manual
+  curl pass.
